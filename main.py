@@ -39,7 +39,7 @@ MSS_CONFIG = {
 VPA_CONFIG = {
     "name": "VPA", "volume_spike_mult": 2.0, "volume_avg_period": 20,
     "min_close_ratio": 0.6, "effort_result_ratio": 0.02,
-    "min_score": 3, "min_score_confirmed": 2,
+    "min_score": 3, "min_score_confirmed": 3, "bear_score_cap": 4,  # FIX: raised 2->3, bear cap added
     "time_filter": False, "bear_filter": False,
 }
 BREAKOUT_CONFIG = {
@@ -52,7 +52,7 @@ BREAKOUT_CONFIG = {
 RISK = {
     "position_units": 5000, "stop_loss_pips": 12, "take_profit_pips": 22,
     "max_positions_per_strategy": 2, "max_total_positions": 6,
-    "cooldown_minutes": 10, "daily_loss_limit_pct": 5.0,
+    "cooldown_minutes": 10, "daily_loss_limit_pct": 5.0, "time_exit_minutes": 30,
 }
 
 STRATEGIES = ["EMA", "MSS", "VPA", "Breakout"]
@@ -73,7 +73,7 @@ bot_state = {
     "daily_paused": False,
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "pending_confirmation": {},  # key -> {signal, candle_time, direction}
-    "version": "ForexCombined-3.0"
+    "version": "ForexCombined-4.0"
 }
 
 # ── OANDA helpers ──────────────────────────────────────────────────────
@@ -335,10 +335,10 @@ def record_exit(symbol, strategy, pnl, win):
     if win: s["wins"] += 1
 
 # ── STRATEGY A: EMA ────────────────────────────────────────────────────
-def run_ema(symbol, regime):
+def run_ema(symbol, regime, tf="M5"):
     cfg = EMA_CONFIG
     try:
-        bars_5m = get_candles(symbol, "M5", 80)
+        bars_5m = get_candles(symbol, tf, 80)
         bars_1h = get_candles(symbol, "H1", 60)
         if len(bars_5m) < 30 or len(bars_1h) < 30: return {}
         closes = [b["close"] for b in bars_5m]
@@ -366,11 +366,11 @@ def run_ema(symbol, regime):
         if rsi > cfg["rsi_hard_gate"]:
             sig = {"price": price, "rsi": round(rsi,1), "blocked": "RSI_HIGH",
                    "buy_score": 0, "confirmed": False, "strategy": "EMA"}
-            bot_state["signals"][symbol]["EMA"] = sig
+            bot_state["signals"][symbol]["EMA" if tf=="M5" else "EMA_15m"] = sig
             return sig
         if not atr_ok:
             sig = {"price": price, "blocked": "ATR_LOW", "buy_score": 0, "confirmed": False, "strategy": "EMA"}
-            bot_state["signals"][symbol]["EMA"] = sig
+            bot_state["signals"][symbol]["EMA" if tf=="M5" else "EMA_15m"] = sig
             return sig
 
         # EMA pullback check
@@ -407,17 +407,17 @@ def run_ema(symbol, regime):
             "near_ema21": near_ema21, "near_support": near_support,
             "strategy": "EMA"
         }
-        bot_state["signals"][symbol]["EMA"] = sig
+        bot_state["signals"][symbol]["EMA" if tf=="M5" else "EMA_15m"] = sig
         log.info(f"[EMA] {symbol} | price={price:.5f} RSI={round(rsi,1)} score={score} conf={confirmed}")
         return sig
     except Exception as e:
         log.error(f"[EMA] error {symbol}: {e}"); return {}
 
 # ── STRATEGY B: MSS ────────────────────────────────────────────────────
-def run_mss(symbol, regime):
+def run_mss(symbol, regime, tf="M5"):
     cfg = MSS_CONFIG
     try:
-        bars_5m = get_candles(symbol, "M5", 80)
+        bars_5m = get_candles(symbol, tf, 80)
         bars_1h = get_candles(symbol, "H1", 30)
         if len(bars_5m) < 20 or len(bars_1h) < 15: return {}
         closes = [b["close"] for b in bars_5m]
@@ -446,7 +446,7 @@ def run_mss(symbol, regime):
 
         if trend_1h != "BULL":
             sig = {"price": price, "trend_1h": trend_1h, "buy_score": 0, "strategy": "MSS"}
-            bot_state["signals"][symbol]["MSS"] = sig
+            bot_state["signals"][symbol]["MSS" if tf=="M5" else "MSS_15m"] = sig
             return sig
 
         # Lookback with fallback
@@ -465,12 +465,13 @@ def run_mss(symbol, regime):
 
         score = 0
         if mss: score += 3
+        # FIX: forex MSS underperformed (29% WR) — require RSI rising strictly, no fallback credit
         if rsi < cfg["rsi_soft_threshold"] and rsi_rising: score += 2
-        elif rsi < cfg["rsi_soft_threshold"]: score += 1
         if vol_ratio >= cfg["volume_bonus_mult"]: score += 1
 
-        min_score = cfg["min_score_confirmed"] if confirmed else cfg["min_score"]
-        if score >= cfg["min_score_confirmed"] and score < cfg["min_score"] and not confirmed:
+        if score >= cfg["min_score"]:
+            confirmed = True
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
             set_pending_confirmation(symbol, "MSS", "BUY", {"score": score})
 
         sig = {
@@ -479,17 +480,17 @@ def run_mss(symbol, regime):
             "vol_ratio": round(vol_ratio,2), "buy_score": score,
             "confirmed": confirmed, "lookback": lookback, "strategy": "MSS"
         }
-        bot_state["signals"][symbol]["MSS"] = sig
+        bot_state["signals"][symbol]["MSS" if tf=="M5" else "MSS_15m"] = sig
         log.info(f"[MSS] {symbol} | trend={trend_1h} MSS={mss} score={score} conf={confirmed}")
         return sig
     except Exception as e:
         log.error(f"[MSS] error {symbol}: {e}"); return {}
 
 # ── STRATEGY C: VPA ────────────────────────────────────────────────────
-def run_vpa(symbol, regime):
+def run_vpa(symbol, regime, tf="M5"):
     cfg = VPA_CONFIG
     try:
-        bars = get_candles(symbol, "M5", 40)
+        bars = get_candles(symbol, tf, 40)
         if len(bars) < 25: return {}
         volumes = [b["volume"] for b in bars]; closes = [b["close"] for b in bars]
         opens = [b["open"] for b in bars]; highs = [b["high"] for b in bars]
@@ -518,8 +519,15 @@ def run_vpa(symbol, regime):
         ema20 = calc_ema(closes, 20)
         if ema20 and price > ema20[-1]: score += 1
 
-        min_score = cfg["min_score_confirmed"] if confirmed else cfg["min_score"]
-        if score >= cfg["min_score_confirmed"] and score < cfg["min_score"] and not confirmed:
+        # FIX: cap score in bear regime — high VPA scores in a downtrend = distribution, not accumulation
+        raw_score = score
+        if regime == "BEAR" and score > cfg.get("bear_score_cap", 99):
+            score = cfg["bear_score_cap"]
+            signals_detected.append("BEAR_CAPPED")
+
+        if score >= cfg["min_score"]:
+            confirmed = True
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
             set_pending_confirmation(symbol, "VPA", "BUY", {"score": score})
 
         sig = {
@@ -527,17 +535,17 @@ def run_vpa(symbol, regime):
             "close_ratio": round(close_ratio,2), "buy_score": score,
             "signals": signals_detected, "confirmed": confirmed, "strategy": "VPA"
         }
-        bot_state["signals"][symbol]["VPA"] = sig
+        bot_state["signals"][symbol]["VPA" if tf=="M5" else "VPA_15m"] = sig
         log.info(f"[VPA] {symbol} | vol={round(vol_ratio,2)}x score={score} sigs={signals_detected} conf={confirmed}")
         return sig
     except Exception as e:
         log.error(f"[VPA] error {symbol}: {e}"); return {}
 
 # ── STRATEGY D: BREAKOUT ───────────────────────────────────────────────
-def run_breakout(symbol, regime):
+def run_breakout(symbol, regime, tf="M5"):
     cfg = BREAKOUT_CONFIG
     try:
-        bars = get_candles(symbol, "M5", 40)
+        bars = get_candles(symbol, tf, 40)
         if len(bars) < 12: return {}
         closes = [b["close"] for b in bars]; highs = [b["high"] for b in bars]
         lows = [b["low"] for b in bars]; volumes = [b["volume"] for b in bars]
@@ -583,7 +591,7 @@ def run_breakout(symbol, regime):
             "buy_score": score, "confirmed": confirmed,
             "consol_high": round(c_high,5), "strategy": "Breakout"
         }
-        bot_state["signals"][symbol]["Breakout"] = sig
+        bot_state["signals"][symbol]["Breakout" if tf=="M5" else "Breakout_15m"] = sig
         log.info(f"[Breakout] {symbol} | vol={round(vol_ratio,1)}x consol={round(c_range_pips,1)}p breakout={is_breakout} conf={confirmed}")
         return sig
     except Exception as e:
@@ -601,10 +609,20 @@ def check_exits(symbol, now):
     pnl_pips = (price - entry) / pip_value(symbol)
 
     should_exit = False; reason = ""
+    open_time_str = pos.get("open_time")
+    minutes_open = 0
+    if open_time_str:
+        try:
+            minutes_open = (now - datetime.fromisoformat(open_time_str)).total_seconds() / 60
+        except: pass
+
     if pnl_pips >= RISK["take_profit_pips"]:
         should_exit = True; reason = f"Take profit (+{round(pnl_pips,1)}p)"
     elif pnl_pips <= -RISK["stop_loss_pips"]:
         should_exit = True; reason = f"Stop loss ({round(pnl_pips,1)}p)"
+        bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
+    elif minutes_open >= RISK.get("time_exit_minutes", 30) and pnl_pips < 0:
+        should_exit = True; reason = f"30min time exit ({round(pnl_pips,1)}p)"
         bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
 
     if should_exit:
@@ -675,11 +693,11 @@ def trading_loop():
         log.warning("No OANDA credentials — cannot start"); return
 
     add_diary("SYSTEM",
-        "ForexAI v3.0 started | 4 Strategies | 7 Pairs | "
-        "Confirmation candles | 2 pos/strategy | 10min cooldown | "
-        "VPA+Breakout no bear filter | S/R zones | EMA pullback",
+        "ForexAI v4.0 started | 4 Strategies | 7 Pairs | M5+M15 scanning | "
+        "VPA confirmed 2->3 | Bear score cap 4 | 30min time exit | "
+        "MSS tightened (strict RSI-rising) | Score 4+ skips confirmation",
         "system")
-    log.info("ForexAI Combined Bot v3.0 started")
+    log.info("ForexAI Combined Bot v4.0 started")
 
     regime_check_time = None; daily_reset_date = None
 
@@ -713,12 +731,15 @@ def trading_loop():
 
                 check_exits(symbol, now)
 
-                # Priority: Breakout > VPA > MSS > EMA
+                # Priority: Breakout > VPA > MSS > EMA — now scanning M5 + M15 (FIX: 15M added)
                 for strat, run_fn in [("Breakout", run_breakout), ("VPA", run_vpa),
                                       ("MSS", run_mss), ("EMA", run_ema)]:
                     if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
-                        sig = run_fn(symbol, regime)
-                        if sig: try_entry(symbol, strat, sig, regime, now)
+                        sig_5m = run_fn(symbol, regime, "M5")
+                        if sig_5m: try_entry(symbol, strat, sig_5m, regime, now)
+                    if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
+                        sig_15m = run_fn(symbol, regime, "M15")
+                        if sig_15m: try_entry(symbol, strat, sig_15m, regime, now)
 
         except Exception as e:
             log.error(f"Loop error: {e}")
