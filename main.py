@@ -73,7 +73,7 @@ bot_state = {
     "daily_paused": False,
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "pending_confirmation": {},  # key -> {signal, candle_time, direction}
-    "version": "ForexCombined-4.0"
+    "version": "ForexCombined-5.0"
 }
 
 # ── OANDA helpers ──────────────────────────────────────────────────────
@@ -609,21 +609,12 @@ def check_exits(symbol, now):
     pnl_pips = (price - entry) / pip_value(symbol)
 
     should_exit = False; reason = ""
-    open_time_str = pos.get("open_time")
-    minutes_open = 0
-    if open_time_str:
-        try:
-            minutes_open = (now - datetime.fromisoformat(open_time_str)).total_seconds() / 60
-        except: pass
-
     if pnl_pips >= RISK["take_profit_pips"]:
         should_exit = True; reason = f"Take profit (+{round(pnl_pips,1)}p)"
     elif pnl_pips <= -RISK["stop_loss_pips"]:
         should_exit = True; reason = f"Stop loss ({round(pnl_pips,1)}p)"
         bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
-    elif minutes_open >= RISK.get("time_exit_minutes", 30) and pnl_pips < 0:
-        should_exit = True; reason = f"30min time exit ({round(pnl_pips,1)}p)"
-        bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
+    # No time exit — let TP and SL do their job (forex needs 1-4 hours to develop)
 
     if should_exit:
         exit_price = close_position(symbol, trade_id)
@@ -693,11 +684,11 @@ def trading_loop():
         log.warning("No OANDA credentials — cannot start"); return
 
     add_diary("SYSTEM",
-        "ForexAI v4.0 started | 4 Strategies | 7 Pairs | M5+M15 scanning | "
+        "ForexAI v5.0 started | 4 Strategies | 7 Pairs | M5+M15 scanning | "
         "VPA confirmed 2->3 | Bear score cap 4 | 30min time exit | "
         "MSS tightened (strict RSI-rising) | Score 4+ skips confirmation",
         "system")
-    log.info("ForexAI Combined Bot v4.0 started")
+    log.info("ForexAI Combined Bot v5.0 started")
 
     regime_check_time = None; daily_reset_date = None
 
