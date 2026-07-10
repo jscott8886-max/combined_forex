@@ -33,8 +33,9 @@ EMA_CONFIG = {
 MSS_CONFIG = {
     "name": "MSS", "swing_lookback": 10, "swing_fallback": 7, "fallback_hours": 4,
     "rsi_soft_threshold": 50, "atr_min_mult": 0.7, "volume_bonus_mult": 1.5,
-    "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,
+    "time_filter": True, "time_start_utc": 12, "time_end_utc": 17,  # FIX: narrowed to London/NY overlap only
     "bear_filter": True, "min_score": 4, "min_score_confirmed": 3,
+    "blocked_pairs": ["AUD_USD"],  # FIX: 0% win rate across 2 weeks — data is conclusive
 }
 VPA_CONFIG = {
     "name": "VPA", "volume_spike_mult": 2.0, "volume_avg_period": 20,
@@ -44,15 +45,19 @@ VPA_CONFIG = {
 }
 BREAKOUT_CONFIG = {
     "name": "Breakout", "consolidation_candles": 8, "consolidation_pips": 15,
-    "breakout_volume_mult": 1.5, "breakout_candle_close_ratio": 0.65,
+    "breakout_volume_mult": 2.0,  # FIX: raised 1.5->2.0 — filters out stop hunts
+    "breakout_candle_close_ratio": 0.65,
     "min_breakout_pips": 3, "min_score": 4, "min_score_confirmed": 3,
-    "time_filter": False, "bear_filter": False,
+    "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,  # FIX: no more off-hours false breakouts
+    "bear_filter": False,
+    "blocked_pairs": ["USD_CAD"],  # FIX: 0% win rate — this pair chops, doesn't trend after breaks
 }
 
 RISK = {
     "position_units": 5000, "stop_loss_pips": 12, "take_profit_pips": 22,
     "max_positions_per_strategy": 2, "max_total_positions": 6,
-    "cooldown_minutes": 10, "daily_loss_limit_pct": 5.0, "time_exit_minutes": 30,
+    "cooldown_minutes": 10, "mss_cooldown_minutes": 120,  # FIX: MSS gets 2hr cooldown like VPA
+    "daily_loss_limit_pct": 5.0,
 }
 
 STRATEGIES = ["EMA", "MSS", "VPA", "Breakout"]
@@ -73,7 +78,7 @@ bot_state = {
     "daily_paused": False,
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "pending_confirmation": {},  # key -> {signal, candle_time, direction}
-    "version": "ForexCombined-5.0"
+    "version": "ForexCombined-6.0"
 }
 
 # ── OANDA helpers ──────────────────────────────────────────────────────
@@ -315,11 +320,23 @@ def can_enter(symbol, strategy):
     if len(bot_state["positions"]) >= RISK["max_total_positions"]: return False
     if len(bot_state["strategy_positions"][strategy]) >= RISK["max_positions_per_strategy"]: return False
     if symbol in bot_state["positions"]: return False
+
+    # FIX: Check blocked pairs per strategy
+    cfg_map = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG}
+    cfg = cfg_map.get(strategy, {})
+    if symbol in cfg.get("blocked_pairs", []):
+        return False
+
+    # FIX: MSS gets 2-hour cooldown like crypto VPA
     ck = f"{strategy}_{symbol}"
     if ck in bot_state["active_cooldowns"]:
+        if strategy == "MSS":
+            cooldown = RISK.get("mss_cooldown_minutes", 120)
+        else:
+            cooldown = RISK["cooldown_minutes"]
         elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(
             bot_state["active_cooldowns"][ck])).total_seconds() / 60
-        if elapsed < RISK["cooldown_minutes"]: return False
+        if elapsed < cooldown: return False
         del bot_state["active_cooldowns"][ck]
     return True
 
@@ -684,11 +701,13 @@ def trading_loop():
         log.warning("No OANDA credentials — cannot start"); return
 
     add_diary("SYSTEM",
-        "ForexAI v5.0 started | 4 Strategies | 7 Pairs | M5+M15 scanning | "
-        "VPA confirmed 2->3 | Bear score cap 4 | 30min time exit | "
-        "MSS tightened (strict RSI-rising) | Score 4+ skips confirmation",
+        "ForexAI v6.0 started | 4 Strategies | 7 Pairs | M5+M15 scanning | "
+        "VPA confirmed 3 | Bear score cap 4 | No time exit (TP/SL natural) | "
+        "MSS blocked AUD_USD + 2hr cooldown + 12-17UTC window | "
+        "Breakout blocked USD_CAD + 2.0x vol + 07-17UTC window | "
+        "Score 4+ skips confirmation",
         "system")
-    log.info("ForexAI Combined Bot v5.0 started")
+    log.info("ForexAI Combined Bot v6.0 started")
 
     regime_check_time = None; daily_reset_date = None
 
