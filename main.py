@@ -62,6 +62,7 @@ RISK = {
     "position_units": 5000, "stop_loss_pips": 12, "take_profit_pips": 22,
     "max_positions_per_strategy": 2, "max_total_positions": 6,
     "cooldown_minutes": 10, "mss_cooldown_minutes": 120,
+    "counter_trend_units": 2500,  # FIX: half size when trading against trend
     "daily_loss_limit_pct": 5.0,
 }
 
@@ -81,7 +82,7 @@ bot_state = {
     "daily_paused": False, "pending_confirmation": {},
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "loss_streak": 0,
-    "version": "ForexCombined-7.0"
+    "version": "ForexCombined-8.0"
 }
 
 # ── OANDA helpers ──────────────────────────────────────────────────────
@@ -162,12 +163,21 @@ def sync_positions():
         bot_state["positions"] = synced
     except Exception as e: log.error(f"Sync error: {e}")
 
-def place_order(symbol, units, side):
+def place_order(symbol, units, side, tp_price=None, sl_price=None):
+    """Place market order with server-side SL/TP — OANDA executes stops instantly"""
     try:
         import oandapyV20.endpoints.orders as orders
         client = get_oanda_client()
         actual = units if side == "BUY" else -units
-        data = {"order": {"type": "MARKET", "instrument": symbol, "units": str(actual)}}
+        # Determine pip precision
+        precision = 3 if "JPY" in symbol else 5
+        order_data = {"type": "MARKET", "instrument": symbol, "units": str(actual)}
+        # Server-side SL/TP — no more 60-second delay
+        if sl_price:
+            order_data["stopLossOnFill"] = {"price": str(round(sl_price, precision))}
+        if tp_price:
+            order_data["takeProfitOnFill"] = {"price": str(round(tp_price, precision))}
+        data = {"order": order_data}
         r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=data); client.request(r)
         fill = r.response.get("orderFillTransaction", {})
         return float(fill.get("price", 0))
@@ -582,30 +592,67 @@ def try_entry(symbol, strategy, sig, regime, side, now):
     score_key = "long_score" if side == "BUY" else "short_score"
     score = sig.get(score_key, 0)
     cfg = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG}.get(strategy, {})
-    min_score = cfg.get("min_score", 4)
+    regime = bot_state["market_regime"].get(symbol, "UNKNOWN")
 
-    # Score 4+ skips confirmation
-    if score >= min_score:
-        pass  # Good to go
-    elif score >= cfg.get("min_score_confirmed", 3):
-        return  # Need confirmation system — for now skip sub-threshold
+    # FIX: Asymmetric thresholds — favor the trend direction
+    # BEAR: shorts need 3, longs need 5 (shorts are with the trend)
+    # BULL: longs need 3, shorts need 5 (longs are with the trend)
+    if regime == "BEAR":
+        min_score = 3 if side == "SELL" else 5
+    elif regime == "BULL":
+        min_score = 3 if side == "BUY" else 5
     else:
+        min_score = cfg.get("min_score", 4)
+
+    if score < min_score:
         return
 
     order_side = side
-    entry_price = place_order(symbol, RISK["position_units"], order_side)
+    # FIX: Reduce position size when trading against the trend
+    regime = bot_state["market_regime"].get(symbol, "UNKNOWN")
+    with_trend = (regime == "BEAR" and side == "SELL") or (regime == "BULL" and side == "BUY")
+    units = RISK["position_units"] if with_trend else RISK.get("counter_trend_units", 2500)
+
+    # Calculate TP and SL prices for server-side execution
+    pv = pip_value(symbol)
+    if side == "BUY":
+        tp_price = None  # Will be set after we know entry price
+        sl_price = None
+    else:
+        tp_price = None
+        sl_price = None
+
+    entry_price = place_order(symbol, units, order_side)
     if entry_price:
         pv = pip_value(symbol)
+        precision = 3 if "JPY" in symbol else 5
         if side == "BUY":
-            tp = round(entry_price + RISK["take_profit_pips"] * pv, 5)
-            sl = round(entry_price - RISK["stop_loss_pips"] * pv, 5)
+            tp = round(entry_price + RISK["take_profit_pips"] * pv, precision)
+            sl = round(entry_price - RISK["stop_loss_pips"] * pv, precision)
         else:
-            tp = round(entry_price - RISK["take_profit_pips"] * pv, 5)
-            sl = round(entry_price + RISK["stop_loss_pips"] * pv, 5)
+            tp = round(entry_price - RISK["take_profit_pips"] * pv, precision)
+            sl = round(entry_price + RISK["stop_loss_pips"] * pv, precision)
+
+        # Set server-side SL/TP on the open trade
+        try:
+            sync_positions()
+            pos = bot_state["positions"].get(symbol, {})
+            trade_id = pos.get("trade_id", "")
+            if trade_id and trade_id != "pending":
+                import oandapyV20.endpoints.trades as trades_ep
+                client = get_oanda_client()
+                sl_tp_data = {
+                    "stopLoss": {"price": str(round(sl, precision))},
+                    "takeProfit": {"price": str(round(tp, precision))}
+                }
+                trades_ep.TradeCRCDO(OANDA_ACCOUNT_ID, trade_id, sl_tp_data)
+                log.info(f"Server-side SL/TP set: SL={sl} TP={tp}")
+        except Exception as e:
+            log.error(f"SL/TP set error: {e}")
 
         side_word = "long" if side == "BUY" else "short"
         bot_state["positions"][symbol] = {"symbol": symbol, "entry": entry_price,
-            "units": RISK["position_units"], "side": side_word, "trade_id": "pending",
+            "units": units, "side": side_word, "trade_id": "pending",
             "open_time": now.isoformat(), "current_price": entry_price,
             "unrealized_pnl": 0, "strategy": strategy}
         bot_state["strategy_positions"][strategy].append(symbol)
@@ -623,11 +670,11 @@ def trading_loop():
         log.warning("No OANDA credentials"); return
 
     add_diary("SYSTEM",
-        "ForexAI v7.0 started | LONG + SHORT enabled | "
+        "ForexAI v8.0 started | LONG + SHORT enabled | "
         "ADX trend filter | 7 Pairs | 4 Strategies | "
         "M5+M15 scanning | No time exit",
         "system")
-    log.info("ForexAI Combined Bot v7.0 started")
+    log.info("ForexAI Combined Bot v8.0 started")
     send_telegram("🚀 <b>Forex Bot v7.0 started</b>\nLONG + SHORT enabled | ADX filter | 7 pairs")
 
     regime_check_time = None; daily_reset_date = None
