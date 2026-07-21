@@ -25,7 +25,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD"]
-STRATEGIES = ["EMA", "MSS", "VPA", "Breakout"]
+STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Sweep"]
 
 EMA_CONFIG = {
     "name": "EMA", "rsi_hard_gate": 55, "bb_min_bw": 0.05,
@@ -57,6 +57,18 @@ BREAKOUT_CONFIG = {
     "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,
     "blocked_pairs": ["USD_CAD"],
 }
+SWEEP_CONFIG = {
+    "name": "Sweep",
+    "swing_lookback": 20,        # bars to find the swing high/low being swept
+    "min_sweep_pips": 2,         # price must poke at least this far past the level
+    "max_sweep_pips": 15,        # but not run away — a sweep, not a trend break
+    "volume_mult": 1.5,          # sweep candle should have elevated volume (stop run)
+    "min_score": 4,
+    "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,
+    "blocked_pairs": [],
+    # NOTE: Sweep has NO adx_min — it deliberately trades REVERSALS, not trends.
+    # A liquidity sweep is a failed breakout; high ADX would filter out the best setups.
+}
 
 RISK = {
     "position_units": 5000, "stop_loss_pips": 12, "take_profit_pips": 22,
@@ -82,7 +94,7 @@ bot_state = {
     "daily_paused": False, "pending_confirmation": {},
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "loss_streak": 0,
-    "version": "ForexCombined-8.0"
+    "version": "ForexCombined-8.1"
 }
 
 # ── OANDA helpers ──────────────────────────────────────────────────────
@@ -283,7 +295,7 @@ def can_enter(symbol, strategy, side="BUY"):
     if len(bot_state["positions"]) >= RISK["max_total_positions"]: return False
     if len(bot_state["strategy_positions"][strategy]) >= RISK["max_positions_per_strategy"]: return False
     if symbol in bot_state["positions"]: return False
-    cfg_map = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG}
+    cfg_map = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG, "Sweep": SWEEP_CONFIG}
     cfg = cfg_map.get(strategy, {})
     if symbol in cfg.get("blocked_pairs", []): return False
     ck = f"{strategy}_{symbol}"
@@ -542,6 +554,73 @@ def run_breakout(symbol, regime, tf="M5"):
         return sig
     except Exception as e: log.error(f"[Breakout] error {symbol}: {e}"); return {}
 
+def run_sweep(symbol, regime, tf="M5"):
+    """Liquidity Sweep Reversal (Smart Money Concept).
+    Detects when price spikes PAST a recent swing high/low (grabbing stop-order
+    liquidity) then FAILS and closes back on the other side — a reversal signal.
+
+    Bullish sweep: price wicks below a recent swing low, then closes back above it
+                   → stops below the low got run, buyers step in → LONG
+    Bearish sweep: price wicks above a recent swing high, then closes back below it
+                   → stops above the high got run, sellers step in → SHORT
+
+    Deliberately does NOT use an ADX trend filter — this trades reversals, not trends.
+    """
+    cfg = SWEEP_CONFIG
+    try:
+        bars = get_candles(symbol, tf, 40)
+        if len(bars) < cfg["swing_lookback"] + 3: return {}
+        closes = [b["close"] for b in bars]; highs = [b["high"] for b in bars]
+        lows = [b["low"] for b in bars]; opens = [b["open"] for b in bars]
+        volumes = [b["volume"] for b in bars]
+        if all(v == 0 for v in volumes[-5:]): return {}
+
+        price = closes[-1]; pv = pip_value(symbol)
+        avg_vol = sum(volumes[-20:]) / len(volumes[-20:]) if volumes[-20:] else 1
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
+
+        # Find the swing high/low over the lookback window, EXCLUDING the last 2 bars
+        # (the sweep itself is the last bar, so we look at the range it swept into)
+        window = bars[-(cfg["swing_lookback"]+2):-2]
+        swing_high = max(b["high"] for b in window)
+        swing_low  = min(b["low"] for b in window)
+
+        cur = bars[-1]
+        cur_high = cur["high"]; cur_low = cur["low"]
+        cur_close = cur["close"]; cur_open = cur["open"]
+        bar_range = cur_high - cur_low
+        if bar_range == 0: return {}
+        close_ratio = (cur_close - cur_low) / bar_range
+
+        # BULLISH SWEEP: wick pierced below swing low, but closed back ABOVE it
+        swept_low_pips = pips(symbol, swing_low - cur_low)   # how far below the low we poked
+        bull_sweep = (cur_low < swing_low                                   # wicked below
+                      and cur_close > swing_low                             # closed back above
+                      and cfg["min_sweep_pips"] <= swept_low_pips <= cfg["max_sweep_pips"]
+                      and close_ratio >= 0.5                                # closed in upper half
+                      and vol_ratio >= cfg["volume_mult"])                  # elevated volume (stop run)
+
+        # BEARISH SWEEP: wick pierced above swing high, but closed back BELOW it
+        swept_high_pips = pips(symbol, cur_high - swing_high)
+        bear_sweep = (cur_high > swing_high                                 # wicked above
+                      and cur_close < swing_high                            # closed back below
+                      and cfg["min_sweep_pips"] <= swept_high_pips <= cfg["max_sweep_pips"]
+                      and close_ratio <= 0.5                                # closed in lower half
+                      and vol_ratio >= cfg["volume_mult"])
+
+        long_score = 4 if bull_sweep else 0
+        short_score = 4 if bear_sweep else 0
+
+        sig = {"price": price, "vol_ratio": round(vol_ratio,2),
+               "swing_high": round(swing_high,5), "swing_low": round(swing_low,5),
+               "bull_sweep": bull_sweep, "bear_sweep": bear_sweep,
+               "long_score": long_score, "short_score": short_score, "strategy": "Sweep"}
+        bot_state["signals"][symbol]["Sweep" if tf=="M5" else "Sweep_15m"] = sig
+        if bull_sweep or bear_sweep:
+            log.info(f"[Sweep] {symbol} | bullSweep={bull_sweep} bearSweep={bear_sweep} vol={round(vol_ratio,1)}x")
+        return sig
+    except Exception as e: log.error(f"[Sweep] error {symbol}: {e}"); return {}
+
 # ── EXIT / ENTRY ───────────────────────────────────────────────────────
 def check_exits(symbol, now):
     pos = bot_state["positions"].get(symbol)
@@ -591,13 +670,18 @@ def try_entry(symbol, strategy, sig, regime, side, now):
 
     score_key = "long_score" if side == "BUY" else "short_score"
     score = sig.get(score_key, 0)
-    cfg = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG}.get(strategy, {})
+    cfg = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG, "Sweep": SWEEP_CONFIG}.get(strategy, {})
     regime = bot_state["market_regime"].get(symbol, "UNKNOWN")
 
     # FIX: Asymmetric thresholds — favor the trend direction
     # BEAR: shorts need 3, longs need 5 (shorts are with the trend)
     # BULL: longs need 3, shorts need 5 (longs are with the trend)
-    if regime == "BEAR":
+    # EXCEPTION: Sweep is a REVERSAL strategy by design — it deliberately trades
+    # counter-trend liquidity grabs, so it uses a flat threshold of 4 both directions.
+    # Applying the asymmetric trend filter would block the exact setups it exists to catch.
+    if strategy == "Sweep":
+        min_score = cfg.get("min_score", 4)
+    elif regime == "BEAR":
         min_score = 3 if side == "SELL" else 5
     elif regime == "BULL":
         min_score = 3 if side == "BUY" else 5
@@ -670,11 +754,11 @@ def trading_loop():
         log.warning("No OANDA credentials"); return
 
     add_diary("SYSTEM",
-        "ForexAI v8.0 started | LONG + SHORT enabled | "
+        "ForexAI v8.1 started (+Sweep liquidity detector) | LONG + SHORT enabled | "
         "ADX trend filter | 7 Pairs | 4 Strategies | "
         "M5+M15 scanning | No time exit",
         "system")
-    log.info("ForexAI Combined Bot v8.0 started")
+    log.info("ForexAI Combined Bot v8.1 started")
     send_telegram("🚀 <b>Forex Bot v7.0 started</b>\nLONG + SHORT enabled | ADX filter | 7 pairs")
 
     regime_check_time = None; daily_reset_date = None
@@ -713,7 +797,7 @@ def trading_loop():
                 check_exits(symbol, now)
 
                 for strat, run_fn in [("Breakout", run_breakout), ("EMA", run_ema),
-                                      ("MSS", run_mss), ("VPA", run_vpa)]:
+                                      ("MSS", run_mss), ("VPA", run_vpa), ("Sweep", run_sweep)]:
                     if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
                         for tf in ["M5", "M15"]:
                             sig = run_fn(symbol, regime, tf)
