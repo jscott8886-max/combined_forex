@@ -31,7 +31,9 @@ EMA_CONFIG = {
     "name": "EMA", "rsi_hard_gate": 55, "bb_min_bw": 0.05,
     "min_score": 4, "min_score_confirmed": 3,
     "atr_min_mult": 0.7, "volume_bonus_mult": 1.5,
-    "adx_min": 20,
+    "adx_min": 20,            # shorts still use this floor
+    "adx_min_long": 25,       # FIX 2: longs need a stronger trend (ADX 20-25 dead zone went 1W/5L)
+    "block_long_in_bear": True,  # FIX 1: EMA longs in BEAR regime lost $54 this week — shorts only
     "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,
     "blocked_pairs": [],
 }
@@ -94,7 +96,7 @@ bot_state = {
     "daily_paused": False, "pending_confirmation": {},
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "loss_streak": 0,
-    "version": "ForexCombined-8.1"
+    "version": "ForexCombined-8.2"
 }
 
 # ── OANDA helpers ──────────────────────────────────────────────────────
@@ -354,10 +356,14 @@ def run_ema(symbol, regime, tf="M5"):
         avg_vol = sum(volumes[-20:]) / 20; vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
         atr_ok = avg_atr == 0 or atr >= avg_atr * cfg["atr_min_mult"]
         trending = adx >= cfg["adx_min"]
+        # FIX 2: longs require a stronger trend than shorts (higher ADX floor)
+        trending_long = adx >= cfg.get("adx_min_long", cfg["adx_min"])
+        # FIX 1: block EMA longs entirely when this pair is in a BEAR regime
+        long_allowed = not (cfg.get("block_long_in_bear", False) and regime == "BEAR")
 
         # LONG score
         long_score = 0
-        if rsi <= cfg["rsi_hard_gate"] and atr_ok and trending:
+        if long_allowed and rsi <= cfg["rsi_hard_gate"] and atr_ok and trending_long:
             if price > ema50_1h[-1]: long_score += 1
             if ema9[-1] > ema21[-1]: long_score += 2
             if len(ema9) > 1 and ema9[-1] > ema21[-1] and ema9[-2] <= ema21[-2]: long_score += 1
@@ -754,11 +760,11 @@ def trading_loop():
         log.warning("No OANDA credentials"); return
 
     add_diary("SYSTEM",
-        "ForexAI v8.1 started (+Sweep liquidity detector) | LONG + SHORT enabled | "
+        "ForexAI v8.2 started (+EMA long filters: no bear longs, ADX>=25) | LONG + SHORT enabled | "
         "ADX trend filter | 7 Pairs | 4 Strategies | "
         "M5+M15 scanning | No time exit",
         "system")
-    log.info("ForexAI Combined Bot v8.1 started")
+    log.info("ForexAI Combined Bot v8.2 started")
     send_telegram("🚀 <b>Forex Bot v7.0 started</b>\nLONG + SHORT enabled | ADX filter | 7 pairs")
 
     regime_check_time = None; daily_reset_date = None
