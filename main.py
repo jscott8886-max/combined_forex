@@ -1,6 +1,8 @@
-# ForexAI Combined Bot - v7.0
-# 4 Strategies: EMA + MSS + VPA + Breakout | LONG + SHORT
-# 7 Pairs | ADX trend filter | Short selling enabled
+# ForexAI Combined Bot - v8.2
+# 5 Strategies: EMA + MSS + VPA + Breakout + Sweep | LONG + SHORT
+# 7 Pairs | ADX trend filter | Short selling enabled | Server-side bracket orders
+# Asymmetric scoring (favors trend direction) | Counter-trend position sizing
+# EMA longs blocked in BEAR regime + ADX>=25 required for EMA longs
 # No time exit — TP/SL natural exits
 import os, time, logging, math
 from datetime import datetime, timezone, timedelta
